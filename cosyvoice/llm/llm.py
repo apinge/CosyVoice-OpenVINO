@@ -20,7 +20,9 @@ from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from cosyvoice.utils.common import IGNORE_ID
 from cosyvoice.transformer.label_smoothing_loss import LabelSmoothingLoss
 from cosyvoice.utils.common import th_accuracy
-
+import openvino as ov
+from pathlib import Path
+from openvino.runtime import opset13
 
 class TransformerLM(torch.nn.Module):
     def __init__(
@@ -223,9 +225,14 @@ class Qwen2Encoder(torch.nn.Module):
     def __init__(self, pretrain_path):
         super().__init__()
         self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path)
+        self.config = self.model.config # add config
+        #self.ov_model = ov.compile_model('/home/gta/qiu/CosyVoice/CosyVoice2-0.5B-fp16/openvino_model.xml')
+        #self.infer_request = self.ov_model.create_infer_request()
+        #print("compiler ov model ok")
 
     def forward_one_step(self, xs, masks, cache=None):
         input_masks = masks[:, -1, :]
+        #breakpoint()
         outs = self.model(
             inputs_embeds=xs,
             attention_mask=input_masks,
@@ -237,8 +244,215 @@ class Qwen2Encoder(torch.nn.Module):
         xs = outs.hidden_states[-1]
         new_cache = outs.past_key_values
         return xs, new_cache
+    
+    def forward(self, inputs_embeds, attention_mask, past_key_values=None):
+
+        outs = self.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=True,
+            past_key_values=past_key_values,
+        )
+        # breakpoint()
+        xs = outs.hidden_states[-1]
+        new_cache = outs.past_key_values
+        return xs, new_cache
+
+    def forward_one_step_ov(self, xs, masks, cache=None):
+        input_masks = masks[:, -1, :]
+        input_dict = {}
+        input_dict['inputs_embeds'] = xs
+        input_dict['attention_mask'] = torch.tensor(input_masks)
+        input_dict['output_hidden_states'] =  torch.tensor([True])
+        input_dict['return_dict'] = torch.tensor([True])
+        input_dict['use_cache'] = torch.tensor([True])
+        input_dict['past_key_values'] = torch.tensor(cache)
+        self.infer_request.start_async(inputs=input_dict,share_inputs=True)
+        self.infer_request.wait()
+        outputs = self.infer_request.outputs
+        xs =  self.infer_request.get_tensor().data().copy()
+        new_cache = self.infer_request.get_tensor().data().copy()
+        #breakpoint()
+        return xs, new_cache
+
+def model_has_state(ov_model: ov.Model):
+    # TODO: Provide a better way based on the variables availability, but OV Python API doesn't expose required methods
+    return len(ov_model.get_sinks()) > 0
 
 
+def model_has_input_output_name(ov_model: ov.Model, name: str):
+    """
+    Helper function for checking that model has specified input or output name
+
+    Parameters:
+      ov_model (ov.Model):   # TODO: Can we derive the dimensions from the model topology?
+      name (str):
+          name of input or output
+
+    Returns:
+      True if input or output with requested name exists else False
+    """
+    return name in sum([list(t.get_names()) for t in ov_model.inputs + ov_model.outputs], [])
+
+
+def fuse_cache_reorder(
+    ov_model: ov.Model,
+    not_kv_inputs: List[str],
+    key_value_input_names: List[str],
+    gather_dim: int,
+):
+    """
+    Fuses reored_cache during generate cycle into ov.Model. Used with stateful models, because we can not modify model state directly.
+
+    Adds a new beam_idx parameter and Gather op per each kv-cache input in a given model.
+    Should be run before make_stateful. Implements optimumum's _reorder_cache
+    inside the model in the beginning of each iteration.
+    Gather works along given gather_dim dimension that may vary from model to model.
+    KV-cache inputs are identified based on names in key_value_input_names.
+    Append the new beam_idx parameter to not_kv_inputs.
+
+    Parameters:
+      ov_model (`ov.Model`):
+          openvino model for processing
+      not_kv_inputs (`List[str]`):
+          list of input nodes in model that not related to past key values
+      key_value_input_names (`List[str]`):
+          list of names for key value input layers
+      gather_dim (int):
+          dimension for gathering cache during reorder pass
+    """
+
+    if model_has_input_output_name(ov_model, "beam_idx"):
+        raise ValueError("Model already has fused cache")
+    input_batch = ov_model.input("inputs_embeds").get_partial_shape()[0]
+    # input_batch = ov_model.input("input_ids").get_partial_shape()[0]
+    
+    beam_idx = opset13.parameter(name="beam_idx", dtype=ov.Type.i32, shape=ov.PartialShape([input_batch]))
+    beam_idx.output(0).get_tensor().add_names({"beam_idx"})  # why list is not accepted?
+    ov_model.add_parameters([beam_idx])
+    not_kv_inputs.append(ov_model.inputs[-1])
+    # Go over all cache parameters and fuse _reorder_cache with indices provided by the new parameter beam_idx
+    for input_name in key_value_input_names:
+        parameter_output_port = ov_model.input(input_name)
+        consumers = parameter_output_port.get_target_inputs()
+        gather = opset13.gather(parameter_output_port, beam_idx, opset13.constant(gather_dim))
+        for consumer in consumers:
+            consumer.replace_source_output(gather.output(0))
+    ov_model.validate_nodes_and_infer_types()
+
+import numpy as np
+def build_state_initializer(ov_model: ov.Model, batch_dim: int):
+    """
+    Build initialization ShapeOf Expression for all ReadValue ops
+
+    Parameters:
+      ov_model (ov.Model):
+          openvino model
+      batch_dim (int):
+          index of dimension corresponding to batch size
+    """
+    input_ids = ov_model.input("inputs_embeds")
+    # input_ids = ov_model.input("input_ids")
+    batch = opset13.gather(
+        opset13.shape_of(input_ids, output_type="i64"),
+        opset13.constant([0]),
+        opset13.constant(0),
+    )
+    for op in ov_model.get_ops():
+        if op.get_type_name() == "ReadValue":
+            dims = [dim.min_length for dim in list(op.get_output_partial_shape(0))]
+            dims[batch_dim] = batch
+            dims = [(opset13.constant(np.array([dim], dtype=np.int64)) if isinstance(dim, int) else dim) for dim in dims]
+            shape = opset13.concat(dims, axis=0)
+            broadcast = opset13.broadcast(opset13.constant(0.0, dtype=op.get_output_element_type(0)), shape)
+            op.set_arguments([broadcast])
+    ov_model.validate_nodes_and_infer_types()
+
+
+def make_stateful(
+    ov_model: ov.Model,
+    not_kv_inputs: List[str],
+    key_value_input_names: List[str],
+    key_value_output_names: List[str],
+    batch_dim: int,
+    num_attention_heads: int,
+    num_beams_and_batch: int = None,
+):
+    """
+    Hides kv-cache inputs and outputs inside the model as variables.
+
+    Parameters:
+        ov_model (ov.Model):
+            openvino model
+        not_kv_inputs (`List[str]`):
+            list of input nodes in model that not related to past key values
+        key_value_input_names (`List[str]`):
+            list of names for key value input layers
+        key_value_output_names (`List[str]`):
+            list of names for key value input layers
+        batch_dim (int):
+            index of batch dimension in key value layers
+        num_attention_heads (int):
+            number of attention heads for batch dimension initialization
+        num_beams_an_batch (int):
+            precalculated number of beams and batch for shapes initialization
+    """
+    from openvino._offline_transformations import apply_make_stateful_transformation
+
+    input_output_map = {}
+
+    if num_beams_and_batch is not None:
+        # Set batch size for input_ids and attention mask to avoid dynamic dimension got propagated from the end of the model back to ReadValue
+        for input in not_kv_inputs:
+            shape = input.get_partial_shape()
+            if shape.rank.get_length() <= 2:  # == 1 for beam_index
+                shape[0] = num_beams_and_batch
+                input.get_node().set_partial_shape(shape)
+    for kv_name_pair in zip(key_value_input_names, key_value_output_names):
+        input_output_map[kv_name_pair[0]] = kv_name_pair[1]
+        if num_beams_and_batch is not None:
+            input = ov_model.input(kv_name_pair[0])
+            shape = input.get_partial_shape()
+            shape[batch_dim] = num_beams_and_batch * num_attention_heads
+            input.get_node().set_partial_shape(shape)
+
+    if num_beams_and_batch is not None:
+        # Re-validation model if shapes are altered above
+        ov_model.validate_nodes_and_infer_types()
+
+    apply_make_stateful_transformation(ov_model, input_output_map)
+    if num_beams_and_batch is None:
+        build_state_initializer(ov_model, batch_dim)
+
+
+def patch_stateful_(ov_model):
+    key_value_input_names = [
+        key.get_any_name() for key in ov_model.inputs if any("key_values" in key_name for key_name in key.get_names())
+    ]
+    key_value_output_names = [
+        key.get_any_name() for key in ov_model.outputs if any("present" in key_name for key_name in key.get_names())
+    ]
+    not_kv_inputs = [
+        input for input in ov_model.inputs if not any(name in key_value_input_names for name in input.get_names())
+    ]
+    if not key_value_input_names or not key_value_output_names:
+        return
+    batch_dim = 0
+    num_attention_heads = 1
+    
+    fuse_cache_reorder(ov_model, not_kv_inputs, key_value_input_names, batch_dim)
+    make_stateful(
+        ov_model,
+        not_kv_inputs,
+        key_value_input_names,
+        key_value_output_names,
+        batch_dim,
+        num_attention_heads,
+        None,
+    )   
+    pass
 class Qwen2LM(torch.nn.Module):
     def __init__(
             self,
@@ -276,6 +490,75 @@ class Qwen2LM(torch.nn.Module):
         # 4. sampling method
         self.sampling = sampling
 
+        # 5. init ov
+        self.core = ov.Core()
+        self.ov_llm = self.core.compile_model('/home/gta/qiu/CosyVoice/ov_models/llm/llm_stateful.xml')
+        self.infer_request = self.ov_llm.create_infer_request()
+    
+    def get_input_names(self):
+        inputs = ['inputs_embeds', 'attention_mask']
+        # inputs = ['attention_mask', 'position_ids']
+        for idx in range(24):
+            inputs.extend([f"past_key_values.{idx}.key", f"past_key_values.{idx}.value"])
+        # inputs.append('inputs_embeds')
+        return inputs
+
+    def get_output_names(self):
+        outputs = ['hidden_states']
+        for idx in range(24):
+            outputs.extend([f"present.{idx}.key", f"present.{idx}.value"])
+        return outputs
+    
+    def llm_convert_to_ov(self, folder, lm_input,masks,cache):
+        export_model = self.llm
+        input_masks = masks[:, -1, :]
+        #breakpoint()
+        example_input = {
+            "inputs_embeds":lm_input,
+            "attention_mask": input_masks,
+            # "output_hidden_states":torch.Tensor([True]),
+            # "return_dict":torch.Tensor([True]),
+            # "use_cache":torch.Tensor([True]),
+            "past_key_values": cache,
+        }
+    
+        ov_model = ov.convert_model(
+            export_model,
+            example_input = example_input,
+        )
+        for input, input_name in zip(ov_model.inputs, self.get_input_names()):
+            input.get_tensor().set_names({input_name})
+        for output, output_name in zip(ov_model.outputs, self.get_output_names()):
+            output.get_tensor().set_names({output_name})
+        print("convert model ok")
+        # from optimum.exporters.openvino.stateful import patch_stateful
+        # patch_stateful(self.llm.config, ov_model)
+        patch_stateful_(ov_model)
+        print("patch_stateful ok")
+        ov_model_path = Path(folder) / "llm_stateful.xml"
+        ov.save_model(ov_model, Path(ov_model_path))
+        # self.llm.config.save_pretrained(self.ov_model_path)
+        pass
+
+    def forward_one_step_ov(self, xs, masks):
+        #print('forward_one_step_ov')
+        input_masks = masks[:, -1, :]
+        input_dict = {}
+        input_dict['inputs_embeds'] = xs
+        input_dict['attention_mask'] = input_masks
+        batch_size = xs.shape[0]
+        #if "beam_idx" in self.input_names:
+        input_dict["beam_idx"] =  torch.from_numpy(np.arange(batch_size, dtype=int))
+       
+        self.infer_request.start_async(inputs=input_dict,share_inputs=True)
+        self.infer_request.wait()
+        #breakpoint()
+        #print('logits: ', self.infer_request.get_tensor('hidden_states').data)
+        #breakpoint()
+        xs = torch.tensor(self.infer_request.get_tensor('hidden_states').data.copy())
+        #print(xs.shape)
+        return xs
+
     def sampling_ids(
             self,
             weighted_scores: torch.Tensor,
@@ -306,7 +589,9 @@ class Qwen2LM(torch.nn.Module):
             sampling: int = 25,
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
+            use_ov: bool = True,
     ) -> Generator[torch.Tensor, None, None]:
+        print("Use ov: ", use_ov)
         device = text.device
         text = torch.concat([prompt_text, text], dim=1)
         text_len += prompt_text_len
@@ -331,10 +616,22 @@ class Qwen2LM(torch.nn.Module):
         # 5. step by step decode
         out_tokens = []
         cache = None
+        has_model = False
         for i in range(max_len):
-            y_pred, cache = self.llm.forward_one_step(lm_input,
+            #if cache is not None and has_model is False:
+            #    self.llm_convert_to_ov('/home/gta/qiu/CosyVoice/ov_models/llm',lm_input.to(torch.float32),
+                                                #masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),cache=cache)
+            #    has_model = True
+            if use_ov:
+                y_pred = self.forward_one_step_ov(lm_input.to(torch.float32),
+                                                            masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
+                                                            )
+        
+            else:
+                y_pred, cache = self.llm.forward_one_step(lm_input,
                                                       masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
                                                       cache=cache)
+            
             logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False).item()
             if top_ids == self.speech_token_size:
