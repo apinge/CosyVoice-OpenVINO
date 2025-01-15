@@ -19,7 +19,8 @@ from torch.nn import functional as F
 from contextlib import nullcontext
 import uuid
 from cosyvoice.utils.common import fade_in_out
-
+from pathlib import Path
+import openvino as ov
 
 class CosyVoiceModel:
 
@@ -89,7 +90,7 @@ class CosyVoiceModel:
         if self.flow.decoder.estimator_engine is None:
             raise ValueError('failed to load trt {}'.format(flow_decoder_estimator_model))
         self.flow.decoder.estimator = self.flow.decoder.estimator_engine.create_execution_context()
-
+    
     def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid):
         with self.llm_context:
             for i in self.llm.inference(text=text.to(self.device),
@@ -112,7 +113,6 @@ class CosyVoiceModel:
                                                   embedding=embedding.to(self.device),
                                                   flow_cache=self.flow_cache_dict[uuid])
         self.flow_cache_dict[uuid] = flow_cache
-
         # mel overlap fade in out
         if self.mel_overlap_dict[uuid].shape[2] != 0:
             tts_mel = fade_in_out(tts_mel, self.mel_overlap_dict[uuid], self.mel_window)
@@ -294,8 +294,60 @@ class CosyVoice2Model(CosyVoiceModel):
     def load_jit(self, flow_encoder_model):
         flow_encoder = torch.jit.load(flow_encoder_model, map_location=self.device)
         self.flow.encoder = flow_encoder
+    def convert_flow_to_ov(self, ov_models_folder,token,
+                                token_len,
+                                prompt_token,
+                                prompt_token_len,
+                                prompt_feat,
+                                prompt_feat_len,
+                                embedding,
+                                finalize):
+        ov_models_dir = Path(ov_models_folder) / "flow.xml"
+        export_model = self.flow
+        example_input = {
+            "token": token,
+            "token_len": token_len,
+            "prompt_token": prompt_token,
+            "prompt_token_len": prompt_token_len,
+            "prompt_feat": prompt_feat,
+            "prompt_feat_len": prompt_feat_len,
+            "embedding": embedding,
+            "finalize": finalize
+        }
+        ov_model = ov.convert_model(
+            export_model,
+            example_input,
+        )
+        ov_model.save(ov_models_dir)
+        print("convert flow succeed")
+        pass
+
+    def convert_hift_to_ov(self, ov_models_dir,speech_feat: torch.Tensor, cache_source: torch.Tensor):
+        print("==========convert hift to ov==========")
+        export_model = self.hift.f0_predictor
+        export_model.eval()
+        example_input = {
+            "x": speech_feat,
+        }
+        with torch.no_grad():
+            ov_model = ov.convert_model(
+                input_model = export_model,
+                example_input=example_input,
+            )
+            ov.save_model(ov_model, ov_models_dir)
+        print("==========convert hift succeed==========")
+        pass
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, token_offset, finalize=False, speed=1.0):
+        # if not Path('/home/gta/qiu/CosyVoice/ov_models/flow/flow.xml').exists():
+        #     self.convert_flow_to_ov('/home/gta/qiu/CosyVoice/ov_models/flow',token=token.to(self.device),
+        #                                  token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+        #                                  prompt_token=prompt_token.to(self.device),
+        #                                  prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
+        #                                  prompt_feat=prompt_feat.to(self.device),
+        #                                  prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
+        #                                  embedding=embedding.to(self.device),
+        #                                  finalize=finalize)
         tts_mel, _ = self.flow.inference(token=token.to(self.device),
                                          token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
                                          prompt_token=prompt_token.to(self.device),
@@ -311,6 +363,8 @@ class CosyVoice2Model(CosyVoiceModel):
             tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
         else:
             hift_cache_source = torch.zeros(1, 1, 0)
+        if not Path('/home/gta/qiu/CosyVoice/ov_models/hift/f0_predictor.xml').exists():
+            self.convert_hift_to_ov('/home/gta/qiu/CosyVoice/ov_models/hift/f0_predictor.xml',speech_feat=tts_mel, cache_source=hift_cache_source)
         # keep overlap mel and hift cache
         if finalize is False:
             tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)

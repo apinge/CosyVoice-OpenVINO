@@ -13,8 +13,12 @@
 # limitations under the License.
 import torch
 import torch.nn as nn
-from torch.nn.utils import weight_norm
+from torch.nn.utils.weight_norm import T_module,WeightNorm
 
+
+def my_weight_norm(module: T_module, name: str = "weight", dim: int = 0) -> T_module:
+    WeightNorm.apply(module, name, dim)
+    return module
 
 class ConvRNNF0Predictor(nn.Module):
     def __init__(self,
@@ -26,23 +30,23 @@ class ConvRNNF0Predictor(nn.Module):
 
         self.num_class = num_class
         self.condnet = nn.Sequential(
-            weight_norm(
+            my_weight_norm(
                 nn.Conv1d(in_channels, cond_channels, kernel_size=3, padding=1)
             ),
             nn.ELU(),
-            weight_norm(
+            my_weight_norm(
                 nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)
             ),
             nn.ELU(),
-            weight_norm(
+            my_weight_norm(
                 nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)
             ),
             nn.ELU(),
-            weight_norm(
+            my_weight_norm(
                 nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)
             ),
             nn.ELU(),
-            weight_norm(
+            my_weight_norm(
                 nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)
             ),
             nn.ELU(),
