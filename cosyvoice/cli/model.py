@@ -92,6 +92,7 @@ class CosyVoiceModel:
         self.flow.decoder.estimator = self.flow.decoder.estimator_engine.create_execution_context()
     
     def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid):
+        #self.convert_llm_to_ov("/home/gta/qiu/CosyVoice/ov_models")
         with self.llm_context:
             for i in self.llm.inference(text=text.to(self.device),
                                         text_len=torch.tensor([text.shape[1]], dtype=torch.int32).to(self.device),
@@ -324,10 +325,13 @@ class CosyVoice2Model(CosyVoiceModel):
 
     def convert_hift_to_ov(self, ov_models_dir,speech_feat: torch.Tensor, cache_source: torch.Tensor):
         print("==========convert hift to ov==========")
-        export_model = self.hift.f0_predictor
+        #export_model = self.hift.f0_predictor
+        export_model= self.hift
+        #self.hift.forward = self.hift.decode
         export_model.eval()
         example_input = {
-            "x": speech_feat,
+            "speech_feat": speech_feat,
+            #"cache_source": torch.tensor(cache_source)
         }
         with torch.no_grad():
             ov_model = ov.convert_model(
@@ -360,14 +364,14 @@ class CosyVoice2Model(CosyVoiceModel):
         # append hift cache
         if self.hift_cache_dict[uuid] is not None:
             hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
-            tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
+            tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)  
         else:
             hift_cache_source = torch.zeros(1, 1, 0)
-        if not Path('/home/gta/qiu/CosyVoice/ov_models/hift/f0_predictor.xml').exists():
-            self.convert_hift_to_ov('/home/gta/qiu/CosyVoice/ov_models/hift/f0_predictor.xml',speech_feat=tts_mel, cache_source=hift_cache_source)
+        if not Path('/home/gta/qiu/CosyVoice/ov_models/hift/hift.xml').exists():
+            self.convert_hift_to_ov('/home/gta/qiu/CosyVoice/ov_models/hift/hift.xml',speech_feat=tts_mel, cache_source=hift_cache_source)
         # keep overlap mel and hift cache
         if finalize is False:
-            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, use_ov=True, cache_source=hift_cache_source)
             if self.hift_cache_dict[uuid] is not None:
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
             self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
@@ -378,7 +382,7 @@ class CosyVoice2Model(CosyVoiceModel):
             if speed != 1.0:
                 assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
                 tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
-            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, use_ov=True, cache_source=hift_cache_source)
             if self.hift_cache_dict[uuid] is not None:
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
         return tts_speech

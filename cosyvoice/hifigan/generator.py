@@ -29,7 +29,7 @@ from torch.distributions.uniform import Uniform
 from cosyvoice.transformer.activation import Snake
 from cosyvoice.utils.common import get_padding
 from cosyvoice.utils.common import init_weights
-
+import openvino as ov
 
 """hifigan based generator implementation.
 
@@ -315,6 +315,13 @@ class HiFTGenerator(nn.Module):
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
         self.f0_predictor = f0_predictor
+        """
+        Init openvino model
+        """
+        core = ov.Core()
+        self.ov_model = core.compile_model('/home/gta/qiu/CosyVoice/ov_models/hift/hift.xml')
+        self.infer_request = self.ov_model.create_infer_request()
+        print("======compiled hift openvino model =======")
 
     def remove_weight_norm(self):
         print('Removing weight norm...')
@@ -380,24 +387,65 @@ class HiFTGenerator(nn.Module):
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
 
-    def forward(
-            self,
-            batch: dict,
-            device: torch.device,
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        speech_feat = batch['speech_feat'].transpose(1, 2).to(device)
+    # def forward(
+    #         self,
+    #         batch: dict,
+    #         device: torch.device,
+    # ) -> Dict[str, Optional[torch.Tensor]]:
+    #     speech_feat = batch['speech_feat'].transpose(1, 2).to(device)
+    #     # mel->f0
+    #     f0 = self.f0_predictor(speech_feat)
+    #     # f0->source
+    #     s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+    #     s, _, _ = self.m_source(s)
+    #     s = s.transpose(1, 2)
+    #     # mel+source->speech
+    #     generated_speech = self.decode(x=speech_feat, s=s)
+    #     return generated_speech, f0
+
+    def forward(self, speech_feat: torch.Tensor) -> torch.Tensor:
+        """
+        forward for converting part of the model to openvino ir
+        """
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
-        # mel+source->speech
+        return s
+        """
+        # 假设 s 和 cache_source 是张量
+        condition = torch.tensor(cache_source.shape[2] != 0)  # 将布尔值转换为张量
+        s[:, :, :cache_source.shape[2]] = torch.where(
+                condition,  # 条件
+                cache_source,               # 条件为 True 的值
+                s[:, :, :cache_source.shape[2]]  # 条件为 False 的值（保留原值）
+            )
         generated_speech = self.decode(x=speech_feat, s=s)
-        return generated_speech, f0
+        return generated_speech, s
+        """
+    @torch.inference_mode()
+    def inference(self, speech_feat: torch.Tensor, use_ov:bool, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        if not use_ov:
+            return self.inference_torch(speech_feat, cache_source)
+        else:
+            print("======hift using openvino model======")
+            inputs_dict = {"speech_feat": speech_feat}
+            self.infer_request.start_async(inputs_dict, share_inputs=True)
+            self.infer_request.wait()
+            s = torch.tensor(self.infer_request.get_output_tensor(0).data.copy())
+            if cache_source.shape[2] != 0:
+                s[:, :, :cache_source.shape[2]] = cache_source
+            generated_speech = self.decode(x=speech_feat, s=s)
+            return generated_speech, s
+
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def inference_torch(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        """
+        This is the origin torch inference
+        """
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
