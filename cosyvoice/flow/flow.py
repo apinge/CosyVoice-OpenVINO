@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from omegaconf import DictConfig
 from cosyvoice.utils.mask import make_pad_mask
-
+import openvino as ov
 
 class MaskedDiffWithXvec(torch.nn.Module):
     def __init__(self,
@@ -171,7 +171,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                                        'decoder_params': {'channels': [256, 256], 'dropout': 0.0, 'attention_head_dim': 64,
                                                           'n_blocks': 4, 'num_mid_blocks': 12, 'num_heads': 8, 'act_fn': 'gelu'}},
                  mel_feat_conf: Dict = {'n_fft': 1024, 'num_mels': 80, 'sampling_rate': 22050,
-                                        'hop_size': 256, 'win_size': 1024, 'fmin': 0, 'fmax': 8000}):
+                                        'hop_size': 256, 'win_size': 1024, 'fmin': 0, 'fmax': 8000},
+                 use_ov:bool = True):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
@@ -189,6 +190,15 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
         self.pre_lookahead_len = pre_lookahead_len
+        """
+        load openvino ir
+        """
+        self.use_ov = use_ov
+        if self.use_ov:
+            self.core = ov.Core()
+            self.ov_encoder = self.core.compile_model('/home/qiu/CosyVoice-OpenVINO/ov_models/flow/flow.encoder.xml')
+            self.ov_encoder_infer = self.ov_encoder.create_infer_request()
+            print('======= compile model flow.decoder success =======')
 
     @torch.inference_mode()
     def inference(self,
@@ -214,8 +224,17 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
-        # text encode
-        h, h_lengths = self.encoder(token, token_len)
+        """
+        text encode
+        ov encoder
+        """
+        if self.use_ov:
+            self.ov_encoder_infer.start_async({'xs':token, 'xs_lens':token_len},share_inputs=True)
+            self.ov_encoder_infer.wait()
+            h = torch.Tensor(self.ov_encoder_infer.get_output_tensor(0).data.copy())
+            print("====== ov flow.encoder success ======")
+        else:
+            h, _ = self.encoder(token, token_len)
         if finalize is False:
             h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
@@ -227,12 +246,12 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
-        feat, _ = self.decoder(
+        feat = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10
+            #n_timesteps=10
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2

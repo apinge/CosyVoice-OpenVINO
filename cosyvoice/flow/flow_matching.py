@@ -15,7 +15,7 @@ import threading
 import torch
 import torch.nn.functional as F
 from matcha.models.components.flow_matching import BASECFM
-
+import openvino as ov
 
 class ConditionalCFM(BASECFM):
     def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
@@ -185,12 +185,21 @@ class ConditionalCFM(BASECFM):
 
 
 class CausalConditionalCFM(ConditionalCFM):
-    def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
+    def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None,use_ov: bool = True):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
         self.rand_noise = torch.randn([1, 80, 50 * 300])
+        self.use_ov = use_ov
+        if self.use_ov:
+            core = ov.Core()
+            """
+            flow.decoder.estimator.fp32.xml can be directly converted by "ovc flow.decoder.estimator.fp32.onnx"
+            """
+            self.ov_estimator = core.compile_model('/home/qiu/CosyVoice-OpenVINO/ov_models/flow/flow.decoder.estimator.fp32.xml') 
+            self.ov_estimator_infer = self.ov_estimator.create_infer_request()
+            print('========= compile openvino ir : flow.decoder.estimator.fp32.xml success =========')
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
+    def forward(self, mu, mask, n_timesteps=10, temperature=1.0, spks=None, cond=None):
         """Forward diffusion
 
         Args:
@@ -211,7 +220,28 @@ class CausalConditionalCFM(ConditionalCFM):
 
         z = self.rand_noise[:, :, :mu.size(2)].to(mu.device).to(mu.dtype) * temperature
         # fix prompt and overlap part mu and z
-        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+        t_span = torch.linspace(0, 1, 11, device='cpu', dtype= torch.float32)
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
+    
+    # override the parent function
+    def forward_estimator(self, x, mask, mu, t, spks, cond):
+        if self.use_ov:
+            return self.ov_forwrd_estimator(x, mask, mu, t, spks, cond)
+        else:
+            return self.estimator.forward(x, mask, mu, t, spks, cond)
+    
+    def ov_forwrd_estimator(self, x, mask, mu, t, spks, cond):
+        self.ov_estimator_infer.start_async({ 'x': x,
+                                                                    'mask': mask,
+                                                                    'mu': mu,
+                                                                    't': t,
+                                                                    'spks': spks,
+                                                                    'cond': cond}, share_inputs=True)
+        self.ov_estimator_infer.wait()
+        res = torch.tensor(self.ov_estimator_infer.get_output_tensor(0).data.copy())
+        print("====== ov flow.decoder.estimator success ======")
+        return res
+        
+        

@@ -322,7 +322,191 @@ class CosyVoice2Model(CosyVoiceModel):
         ov_model.save(ov_models_dir)
         print("convert flow succeed")
         pass
+    def convert_flow_encoder_to_ov(self, ov_models_folder,token,
+                                token_len,
+                                prompt_token,
+                                prompt_token_len,
+                                prompt_feat,
+                                prompt_feat_len,
+                                embedding,
+                                finalize):
+        print("==========convert flow.encoder to ov==========")
 
+        ov_models_dir = Path(ov_models_folder) / "flow.encoder.xml"
+        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        from cosyvoice.utils.mask import make_pad_mask
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        token = self.flow.input_embedding(torch.clamp(token, min=0)) * mask
+        export_model = self.flow.encoder
+        export_model.eval()
+        #self.flow.forward = self.flow.encoder_forward
+        example_input = {
+            "xs": token,
+            "xs_lens": token_len,
+        }
+        with torch.no_grad():
+            ov_model = ov.convert_model(
+                input_model = export_model,
+                example_input=example_input,
+                #input=[-1,-1,-1]
+            )
+            ov.save_model(ov_model, ov_models_dir)
+        print("==========convert flow.encoder succeed==========")
+        pass
+    def convert_flow_decoder_to_ov(self, ov_models_folder,token,
+                                token_len,
+                                prompt_token,
+                                prompt_token_len,
+                                prompt_feat,
+                                prompt_feat_len,
+                                embedding,
+                                finalize):
+        print("==========convert flow.decoder to ov==========")
+        ov_models_dir = Path(ov_models_folder) / "flow.decoder.xml"
+        
+        """
+        make input
+        """
+        # if self.flow.fp16 is True:
+        #     prompt_feat = prompt_feat.half()
+        #     embedding = embedding.half()
+
+        # assert token.shape[0] == 1
+        # # xvec projection
+        # from torch.nn import functional as F
+        # embedding = F.normalize(embedding, dim=1)
+        # embedding = self.flow.spk_embed_affine_layer(embedding)
+
+        # # concat text and prompt_text
+        # from cosyvoice.utils.mask import make_pad_mask
+        # token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        # mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        # token = self.flow.input_embedding(torch.clamp(token, min=0)) * mask
+
+        # # text encode
+        # h, h_lengths = self.flow.encoder(token, token_len)
+        # if finalize is False:
+        #     h = h[:, :-self.flow.pre_lookahead_len * self.flow.token_mel_ratio]
+        # mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+        # h = self.flow.encoder_proj(h)
+
+        # # get conditions
+        # conds = torch.zeros([1, mel_len1 + mel_len2, self.flow.output_size], device=token.device).to(h.dtype)
+        # conds[:, :mel_len1] = prompt_feat
+        # conds = conds.transpose(1, 2)
+
+        # mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        save_dir = "/home/gta/qiu/CosyVoice/tensors"
+        import os
+        mu_loaded = torch.load(os.path.join(save_dir, "mu.pt"))
+        mask_loaded = torch.load(os.path.join(save_dir, "mask.pt"))
+        spks_loaded = torch.load(os.path.join(save_dir, "spks.pt"))
+        cond_loaded = torch.load(os.path.join(save_dir, "cond.pt"))
+        """
+        export ov model
+        """
+        export_model = self.flow.decoder
+        export_model.eval()
+      # def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
+        
+        example_input = {
+            "mu": mu_loaded.transpose(1, 2).contiguous(),
+            "mask": mask_loaded.unsqueeze(1),
+            "spks":spks_loaded,
+            "cond":cond_loaded,
+           # "n_timesteps":10
+        }
+        with torch.no_grad():
+            ov_model = ov.convert_model(
+                input_model = export_model,
+                example_input=example_input,
+                verbose = True
+                #input=[-1,-1,-1]
+            )
+            ov.save_model(ov_model, ov_models_dir)
+        print("==========convert flow.decoder succeed==========")
+        pass
+    def convert_flow_decoder_to_ov2(self, ov_models_folder,token,
+                                token_len,
+                                prompt_token,
+                                prompt_token_len,
+                                prompt_feat,
+                                prompt_feat_len,
+                                embedding,
+                                finalize):
+        print("==========convert flow.decoder to ov==========")
+        ov_models_dir = Path(ov_models_folder) / "flow.decoder.xml"
+        
+        """
+        make input
+        """
+        # if self.flow.fp16 is True:
+        #     prompt_feat = prompt_feat.half()
+        #     embedding = embedding.half()
+
+        # assert token.shape[0] == 1
+        # # xvec projection
+        # from torch.nn import functional as F
+        # embedding = F.normalize(embedding, dim=1)
+        # embedding = self.flow.spk_embed_affine_layer(embedding)
+
+        # # concat text and prompt_text
+        # from cosyvoice.utils.mask import make_pad_mask
+        # token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        # mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        # token = self.flow.input_embedding(torch.clamp(token, min=0)) * mask
+
+        # # text encode
+        # h, h_lengths = self.flow.encoder(token, token_len)
+        # if finalize is False:
+        #     h = h[:, :-self.flow.pre_lookahead_len * self.flow.token_mel_ratio]
+        # mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+        # h = self.flow.encoder_proj(h)
+
+        # # get conditions
+        # conds = torch.zeros([1, mel_len1 + mel_len2, self.flow.output_size], device=token.device).to(h.dtype)
+        # conds[:, :mel_len1] = prompt_feat
+        # conds = conds.transpose(1, 2)
+
+        # mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        save_dir = "/home/qiu/CosyVoice-OpenVINO/tensors"
+        import os
+        mu_loaded = torch.load(os.path.join(save_dir, "mu.pt"))
+        mask_loaded = torch.load(os.path.join(save_dir, "mask.pt"))
+        spks_loaded = torch.load(os.path.join(save_dir, "spks.pt"))
+        cond_loaded = torch.load(os.path.join(save_dir, "cond.pt"))
+        """
+        export ov model
+        """
+        from torch.export import export
+        model = self.flow.decoder
+        model.eval()
+
+        example_input = {
+            "mu": mu_loaded.transpose(1, 2).contiguous(),
+            "mask": mask_loaded.unsqueeze(1),
+            "spks": spks_loaded,
+            "cond": cond_loaded,
+        }
+        example_args = (
+            mu_loaded.transpose(1, 2).contiguous(),
+            mask_loaded.unsqueeze(1),
+            spks_loaded,
+            cond_loaded,
+        )
+        
+        with torch.no_grad():
+            exported_model = export(model, args = example_args, kwargs=example_input)
+            ov_model = ov.convert_model(
+                input_model = exported_model,
+                # example_input=example_input,
+                # verbose = True
+                #input=[-1,-1,-1]
+            )
+            ov.save_model(ov_model, ov_models_dir)
+        print("==========convert flow.decoder succeed==========")
+        pass
+    
     def convert_hift_to_ov(self, ov_models_dir,speech_feat: torch.Tensor, cache_source: torch.Tensor):
         print("==========convert hift to ov==========")
         #export_model = self.hift.f0_predictor
@@ -343,15 +527,15 @@ class CosyVoice2Model(CosyVoiceModel):
         pass
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, token_offset, finalize=False, speed=1.0):
-        # if not Path('/home/gta/qiu/CosyVoice/ov_models/flow/flow.xml').exists():
-        #     self.convert_flow_to_ov('/home/gta/qiu/CosyVoice/ov_models/flow',token=token.to(self.device),
-        #                                  token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
-        #                                  prompt_token=prompt_token.to(self.device),
-        #                                  prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
-        #                                  prompt_feat=prompt_feat.to(self.device),
-        #                                  prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
-        #                                  embedding=embedding.to(self.device),
-        #                                  finalize=finalize)
+        # if not Path('/home/qiu/CosyVoice-OpenVINO/ov_models/flow/flow.decoder.xml').exists():
+            # self.convert_flow_decoder_to_ov2('/home/qiu/CosyVoice-OpenVINO/ov_models/flow',token=token.to(self.device),
+            #                              token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+            #                              prompt_token=prompt_token.to(self.device),
+            #                              prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
+            #                              prompt_feat=prompt_feat.to(self.device),
+            #                              prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
+            #                              embedding=embedding.to(self.device),
+            #                              finalize=finalize)
         tts_mel, _ = self.flow.inference(token=token.to(self.device),
                                          token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
                                          prompt_token=prompt_token.to(self.device),
