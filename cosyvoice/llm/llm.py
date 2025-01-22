@@ -537,7 +537,17 @@ class Qwen2LM(torch.nn.Module):
         print("patch_stateful ok")
         ov_model_path = Path(folder) / "llm_stateful.xml"
         ov.save_model(ov_model, Path(ov_model_path))
-        # self.llm.config.save_pretrained(self.ov_model_path)
+        print("==== begin compress llm openvino ir to int4=======")
+
+        import nncf
+        compression_configuration = {
+                "mode": nncf.CompressWeightsMode.INT4_SYM,
+                "group_size": 128,
+                "ratio": 1,
+            }
+        ov_compressed_model = nncf.compress_weights(ov_model, **compression_configuration)
+        ov.save_model(ov_compressed_model, Path(folder) /"llm_stateful_int4.xml")
+        print("==== save llm int4 openvino ir model ok =======")
         pass
 
     def forward_one_step_ov(self, xs, masks):
