@@ -463,6 +463,7 @@ class Qwen2LM(torch.nn.Module):
             sampling: Callable,
             length_normalized_loss: bool = True,
             lsm_weight: float = 0.0,
+            use_ov: bool = True,
     ):
         super().__init__()
         self.llm_input_size = llm_input_size
@@ -491,9 +492,11 @@ class Qwen2LM(torch.nn.Module):
         self.sampling = sampling
 
         # 5. init ov
-        self.core = ov.Core()
-        self.ov_llm = self.core.compile_model('/home/gta/qiu/CosyVoice/ov_models/llm/llm_stateful.xml')
-        self.infer_request = self.ov_llm.create_infer_request()
+        self.use_ov = use_ov
+        if self.use_ov:
+            self.core = ov.Core()
+            self.ov_llm = self.core.compile_model('/home/qiu/CosyVoice-OpenVINO/ov_models/llm/llm_stateful_int4.xml')
+            self.infer_request = self.ov_llm.create_infer_request()
     
     def get_input_names(self):
         inputs = ['inputs_embeds', 'attention_mask']
@@ -562,9 +565,7 @@ class Qwen2LM(torch.nn.Module):
        
         self.infer_request.start_async(inputs=input_dict,share_inputs=True)
         self.infer_request.wait()
-        #breakpoint()
         #print('logits: ', self.infer_request.get_tensor('hidden_states').data)
-        #breakpoint()
         xs = torch.tensor(self.infer_request.get_tensor('hidden_states').data.copy())
         #print(xs.shape)
         return xs
@@ -626,13 +627,14 @@ class Qwen2LM(torch.nn.Module):
         # 5. step by step decode
         out_tokens = []
         cache = None
-        has_model = False
+        if self.use_ov:
+            self.infer_request.reset_state() #clean cache for the first time use
         for i in range(max_len):
             #if cache is not None and has_model is False:
             #    self.llm_convert_to_ov('/home/gta/qiu/CosyVoice/ov_models/llm',lm_input.to(torch.float32),
                                                 #masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),cache=cache)
             #    has_model = True
-            if use_ov:
+            if self.use_ov:
                 y_pred = self.forward_one_step_ov(lm_input.to(torch.float32),
                                                             masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
                                                             )
