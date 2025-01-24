@@ -12,7 +12,7 @@ cosyvoice = CosyVoice2('pretrained_models/CosyVoice2-0.5B', load_jit=False, load
 prompt_speech_16k = load_wav('zero_shot_prompt.wav', 16000)
 
 
-for i, j in enumerate(cosyvoice.inference_zero_shot('青海长云暗雪山，孤城遥望玉门关。 黄沙百战穿金甲，不破楼兰终不还。', '希望你以后能够做的比我还好呦。',prompt_speech_16k, stream=False)):
+for i, j in enumerate(cosyvoice.inference_zero_shot('收到好友从远方寄来的生日礼物，那份意外的惊喜与深深的祝福让我心中充满了甜蜜的快乐，笑容如花儿般绽放。', '希望你以后能够做的比我还好呦。',prompt_speech_16k, stream=False)):
     torchaudio.save('zero_shot_{}_cosyvoice2.wav'.format(i), j['tts_speech'], cosyvoice.sample_rate)
 
 # fine grained control, for supported control, check cosyvoice/tokenizer/tokenizer.py#L248
